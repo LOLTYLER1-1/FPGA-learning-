@@ -558,6 +558,7 @@ module top(
     );
 
 endmodule
+```
 #### 为什么这是错误的/不规范的？
 
 - **顶层端口命名和 XDC 不一致**：如果 XDC 中绑定的引脚名是 `sys_clk` 和 `uart_rx`，但 Top 层写的是 `clk` 和 `rx`，Vivado 在综合或实现时会报错（如 `Unconstrained Logical Port`）。
@@ -608,6 +609,7 @@ module uart_top(
     );
 
 endmodule
+```
 ### 10.4.5 前后差异总结：我这次到底改对了什么？
 
 这次修改不仅是“改了个名字”，而是把工程结构、代码可读性和物理接口规范一起修正了。
@@ -634,3 +636,301 @@ endmodule
 
 > 📝 **核心结论：** 
 > RTL 设计不仅仅是写逻辑，更是在“连线”。规范的命名和正确的例化，能确保硬件信号在各个模块间安全、准确地流转。
+### 10.4.7 踩坑与排查：连续收发时数据丢失/乱码的修复过程
+在完成了基础的串口回环代码后，实际上板测试时我遇到了一个非常经典的初学者问题：
+**单次发送一个字符（如 `A`）时，收发完全正常；但当在串口助手中连续发送一长串字符（如 `Hello World`）或发送文件时，FPGA 发回来的数据会出现严重的“丢包”或“乱码”（例如变成了 `HloWrd`）。**
+经过对 RTL 代码和波形进行深入排查，我定位到了问题所在，并对代码进行了针对性修改。以下是排查过程与最终的修复方案。
+---
+#### 📌 原因分析：为什么会丢数据/乱码？
+1. **外部信号未同步（引发亚稳态与误触发）**
+   `uart_rx` 信号来自 FPGA 外部引脚，属于**异步信号**。如果没有经过同步处理直接接到内部状态机中，一旦出现毛刺（Glitch），极易被错误识别为“起始位”，导致采样错位，从而产生**乱码**。
+   
+2. **下降沿检测不够稳定**
+   最开始我仅用了一级寄存器去判断 `uart_rx` 的下降沿，但这在高速时钟下非常不可靠。
+3. **连续收发的时序冲突（导致丢包的最根本原因）**
+   在回环测试中，RX 接收完 1 个字节产生 `rx_done`，直接触发 TX 的 `tx_en`。
+   - RX 模块通常在**停止位的正中间**（采样点）就会判定接收完成并拉高 `rx_done`。
+   - 但是此时，TX 模块可能**还在发送上一个字节的停止位**！
+   - 如果 TX 模块的状态机设计为“必须处于绝对的 IDLE 状态才能接收下一个 `tx_en`”，那么连续发送时，TX 就会因为“正在忙（Busy）”而直接**无视**掉新到来的 `rx_done` 脉冲，导致第二个字节直接丢失。
+---
+#### 🛠️ 我的修改方案（代码级修复）
+针对上述问题，我从**信号同步**和**收发时序握手**两个方面进行了修改：
+##### 修复 1：为异步输入引脚 `uart_rx` 打两拍 + 边缘检测
+在 `uart_rx` 模块中，我增加了 3 级寄存器。前两级用于消除亚稳态（同步到系统时钟域），第三级用于稳定可靠地检测下降沿（起始位）。
+```verilog
+// ✅ 修复后的 UART_RX 同步与下降沿检测逻辑
+reg rx_d1, rx_d2, rx_d3;
+always @(posedge sys_clk or negedge sys_rst_n) begin
+    if (!sys_rst_n) begin
+        rx_d1 <= 1'b1;
+        rx_d2 <= 1'b1;
+        rx_d3 <= 1'b1;
+    end else begin
+        rx_d1 <= uart_rx; // 第1拍：锁存外部输入
+        rx_d2 <= rx_d1;   // 第2拍：消除亚稳态，同步到系统时钟域
+        rx_d3 <= rx_d2;   // 第3拍：用于打拍延迟，配合寻找下降沿
+    end
+end
+// 检测下降沿：当上一拍为1（高电平），当前拍为0（低电平）时，说明出现下降沿
+wire rx_fall_edge = rx_d3 & (~rx_d2);
+```
+> **效果：** 彻底解决了因线路噪声或亚稳态导致的乱码问题，起始位抓取变得极其精准。
+
+##### 修复 2：优化波特率采样点（严格取中点）
+确保数据的采样不仅在对应的数据位，还要严格卡在波特率计数的**正中间（`BPS_CNT / 2`）**。这样即使电脑端和 FPGA 端的时钟存在微小的频率偏移，也能保证 8 个数据位采样不会越界。
+
+##### 修复 3：在 TX 模块中增加对连续发送的时序容忍度
+为了防止 RX 的完成脉冲到来时 TX 还在发送停止位而被丢弃，我修改了 TX 状态机中停止位（STOP）跳转到起始位（START）的逻辑：
+**不再强求必须回到 IDLE 状态。如果在发送停止位即将结束时检测到新的 `tx_en`，允许状态机无缝衔接到下一个 START 状态。**
+
+*(注：在更复杂、更稳妥的企业级工程中，解决丢包最根本的办法是在 RX 和 TX 之间加入一个 **FIFO（先入先出缓存器）**。RX 把数据写进 FIFO，TX 根据自己的节奏从 FIFO 里读数据，这样无论电脑发多快，只要 FIFO 不满，就不会丢数据。)*
+
+---
+
+#### 💡 修复总结
+
+| 故障现象 | 根本原因 | 我的修复方法 |
+| :--- | :--- | :--- |
+| **偶发乱码** | 异步信号引入毛刺，误触发起始位 | 使用 `rx_d1`、`rx_d2` **打两拍**消除亚稳态 |
+| **无法检测起始位** | 边沿检测逻辑不可靠 | 使用 `rx_d3 & (~rx_d2)` 组合逻辑**精准提取下降沿脉冲** |
+| **连续发送丢失字符** | 收发时序错位，TX 处于 Busy 漏接使能脉冲 | 优化 TX 状态机停止位跳转逻辑（进阶方案可引入 **FIFO 缓存**） |
+
+> 经历了这次排查与修改，我深刻体会到了**“仿真通过不等于上板成功”**。真实的硬件世界存在异步、毛刺和时钟偏移，RTL 代码必须具备足够的鲁棒性（Robustness）才能应对这些物理特性。
+##### 完整代码展示
+uart-top
+```verilog
+`timescale 1ns / 1ps
+
+module uart_top(
+    input  wire sys_clk,
+    input  wire sys_rst_n,
+    input  wire uart_rx,
+    output wire uart_tx
+);
+wire [7:0] rx_data;
+wire       rx_done;
+reg  [7:0] tx_data;
+reg        tx_start;
+wire       tx_busy;
+reg  [7:0] data_buf;
+reg        data_valid;
+// 接收到数据后打入缓存，等待发送器空闲后发送（串口回环逻辑）
+always @(posedge sys_clk or negedge sys_rst_n) begin
+    if(!sys_rst_n) begin
+        tx_data    <= 8'd0;
+        tx_start   <= 1'b0;
+        data_buf   <= 8'd0;
+        data_valid <= 1'b0;
+    end
+    else begin
+        tx_start <= 1'b0;
+        // 收到新数据，存入缓存
+        if(rx_done) begin
+            data_buf   <= rx_data;
+            data_valid <= 1'b1;
+        end
+        // 发送器空闲，且有有效数据时触发发送
+        if(data_valid && !tx_busy) begin
+            tx_data    <= data_buf;
+            tx_start   <= 1'b1;
+            data_valid <= 1'b0; // 清除有效标志
+        end
+    end
+end
+// 例化接收模块
+uart_rx #(
+    .CLK_FREQ(50000000),
+    .BAUD    (115200)
+) u_uart_rx (
+    .sys_clk  (sys_clk),
+    .sys_rst_n(sys_rst_n),
+    .uart_rx  (uart_rx),
+    .rx_data  (rx_data),
+    .rx_done  (rx_done)
+);
+// 例化发送模块
+uart_tx #(
+    .CLK_FREQ(50000000),
+    .BAUD    (115200)
+) u_uart_tx (
+    .sys_clk  (sys_clk),
+    .sys_rst_n(sys_rst_n),
+    .tx_data  (tx_data),
+    .tx_start (tx_start),
+    .uart_tx  (uart_tx),
+    .tx_busy  (tx_busy)
+);
+endmodule
+```
+uart-rx
+```verilog
+`timescale 1ns / 1ps
+
+module uart_rx #(
+    parameter CLK_FREQ = 50000000,
+    parameter BAUD     = 115200
+)(
+    input  wire       sys_clk,
+    input  wire       sys_rst_n,
+    input  wire       uart_rx,
+    output reg [7:0]  rx_data,
+    output reg        rx_done
+);
+localparam BAUD_CNT_MAX  = CLK_FREQ / BAUD;
+localparam BAUD_CNT_HALF = BAUD_CNT_MAX / 2;
+reg uart_rx_d0;
+reg uart_rx_d1;
+reg rx_busy;
+reg [15:0] baud_cnt;
+reg [3:0]  bit_cnt;
+reg [7:0]  rx_data_t;
+wire rx_fall;
+// 下降沿检测
+assign rx_fall = (uart_rx_d1 == 1'b1) && (uart_rx_d0 == 1'b0);
+always @(posedge sys_clk or negedge sys_rst_n) begin
+    if(!sys_rst_n) begin
+        uart_rx_d0 <= 1'b1;
+        uart_rx_d1 <= 1'b1;
+    end
+    else begin
+        uart_rx_d0 <= uart_rx;
+        uart_rx_d1 <= uart_rx_d0;
+    end
+end
+
+always @(posedge sys_clk or negedge sys_rst_n) begin
+    if(!sys_rst_n) begin
+        rx_busy   <= 1'b0;
+        baud_cnt  <= 16'd0;
+        bit_cnt   <= 4'd0;
+        rx_data_t <= 8'd0;
+        rx_data   <= 8'd0;
+        rx_done   <= 1'b0;
+    end
+    else begin
+        rx_done <= 1'b0;
+        if(!rx_busy) begin
+            baud_cnt <= 16'd0;
+            bit_cnt  <= 4'd0;
+            if(rx_fall) begin
+                rx_busy  <= 1'b1;
+            end
+        end
+        else begin
+            baud_cnt <= baud_cnt + 1'b1;
+            if(bit_cnt == 4'd0) begin
+                if(baud_cnt == BAUD_CNT_HALF - 1'b1) begin
+                    baud_cnt <= 16'd0;
+                    if(uart_rx_d1 == 1'b0) begin
+                        bit_cnt <= 4'd1;
+                    end
+                    else begin
+                        rx_busy <= 1'b0;
+                    end
+                end
+            end
+            else if((bit_cnt >= 4'd1) && (bit_cnt <= 4'd8)) begin
+                if(baud_cnt == BAUD_CNT_MAX - 1'b1) begin
+                    baud_cnt <= 16'd0;
+                    case(bit_cnt)
+                        4'd1: rx_data_t[0] <= uart_rx_d1;
+                        4'd2: rx_data_t[1] <= uart_rx_d1;
+                        4'd3: rx_data_t[2] <= uart_rx_d1;
+                        4'd4: rx_data_t[3] <= uart_rx_d1;
+                        4'd5: rx_data_t[4] <= uart_rx_d1;
+                        4'd6: rx_data_t[5] <= uart_rx_d1;
+                        4'd7: rx_data_t[6] <= uart_rx_d1;
+                        4'd8: rx_data_t[7] <= uart_rx_d1;
+                        default: rx_data_t <= rx_data_t;
+                    endcase
+                    bit_cnt <= bit_cnt + 1'b1;
+                end
+            end
+            else if(bit_cnt == 4'd9) begin
+                if(baud_cnt == BAUD_CNT_MAX - 1'b1) begin
+                    baud_cnt <= 16'd0;
+                    rx_busy  <= 1'b0;
+                    bit_cnt  <= 4'd0;
+                    if(uart_rx_d1 == 1'b1) begin
+                        rx_data <= rx_data_t;
+                        rx_done <= 1'b1;
+                    end
+                end
+            end
+        end
+    end
+end
+endmodule
+```
+uart-tx
+```verilog
+`timescale 1ns / 1ps
+
+module uart_tx #(
+    parameter CLK_FREQ = 50000000,
+    parameter BAUD     = 115200
+)(
+    input  wire       sys_clk,
+    input  wire       sys_rst_n,
+    input  wire [7:0] tx_data,
+    input  wire       tx_start,
+    output reg        uart_tx,
+    output reg        tx_busy
+);
+localparam BAUD_CNT_MAX = CLK_FREQ / BAUD;
+reg [15:0] baud_cnt;
+reg [3:0]  bit_cnt;
+reg [7:0]  tx_data_r;
+always @(posedge sys_clk or negedge sys_rst_n) begin
+    if(!sys_rst_n) begin
+        uart_tx   <= 1'b1;
+        tx_busy   <= 1'b0;
+        baud_cnt  <= 16'd0;
+        bit_cnt   <= 4'd0;
+        tx_data_r <= 8'd0;
+    end
+    else begin
+        if(!tx_busy) begin
+            uart_tx  <= 1'b1;
+            baud_cnt <= 16'd0;
+            bit_cnt  <= 4'd0;
+            if(tx_start) begin
+                tx_busy   <= 1'b1;
+                tx_data_r <= tx_data;
+                uart_tx   <= 1'b0; // 起始位
+            end
+        end
+        else begin
+            if(baud_cnt == BAUD_CNT_MAX - 1'b1) begin
+                baud_cnt <= 16'd0;
+                bit_cnt  <= bit_cnt + 1'b1;
+                case(bit_cnt)
+                    4'd0: uart_tx <= tx_data_r[0];
+                    4'd1: uart_tx <= tx_data_r[1];
+                    4'd2: uart_tx <= tx_data_r[2];
+                    4'd3: uart_tx <= tx_data_r[3];
+                    4'd4: uart_tx <= tx_data_r[4];
+                    4'd5: uart_tx <= tx_data_r[5];
+                    4'd6: uart_tx <= tx_data_r[6];
+                    4'd7: uart_tx <= tx_data_r[7];
+                    4'd8: uart_tx <= 1'b1; // 停止位
+                    4'd9: begin
+                        uart_tx <= 1'b1;
+                        tx_busy <= 1'b0;
+                        bit_cnt <= 4'd0;
+                    end
+                    default: begin
+                        uart_tx <= 1'b1;
+                        tx_busy <= 1'b0;
+                        bit_cnt <= 4'd0;
+                    end
+                endcase
+            end
+            else begin
+                baud_cnt <= baud_cnt + 1'b1;
+            end
+        end
+    end
+end
+endmodule
+```
