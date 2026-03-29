@@ -919,7 +919,7 @@ always @(posedge sys_clk or negedge sys_rst_n) begin
                         tx_busy <= 1'b0;
                         bit_cnt <= 4'd0;
                     end
-                    default: begin
+                          default: begin
                         uart_tx <= 1'b1;
                         tx_busy <= 1'b0;
                         bit_cnt <= 4'd0;
