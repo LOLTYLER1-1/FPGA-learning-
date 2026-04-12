@@ -28,6 +28,13 @@
      - [12.5.3 行时序与场时序波形](#1253-行时序与场时序波形)
    - [12.6 显示模式 (HV模式与DE模式)](#126-显示模式-hv模式与de模式)
    - [12.7 硬件接口原理图分析](#127-硬件接口原理图分析)
+13. [正点原子 ZYNQ7020 FPGA 驱动 LCD 屏幕 (800x480) 开发记录](#13-正点原子-zynq7020-fpga-驱动-lcd-屏幕-800x480-开发记录)
+   - [13.1 核心问题与避坑指南](#131-核心问题与避坑指南)
+   - [13.2 800x480 分辨率标准时序参数](#132-800x480-分辨率标准时序参数)
+   - [13.3 顶层模块代码 (Top Module)](#133-顶层模块代码-top-module)
+   - [13.4 时序控制模块代码 (VGA Timing)](#134-时序控制模块代码-vga-timing)
+   - [13.5 彩条测试模块代码 (Color Bar)](#135-彩条测试模块代码-color-bar)
+   - [13.6 常见问题排查清单](#136-常见问题排查清单)
 ---
 
 ## 1. FPGA 基础概念与启动模式
@@ -1119,3 +1126,191 @@ endmodule
 *   **触摸接口**：原理图中包含 `TP_PEN`、`TP_CS`、`TP_MOSI`、`TP_MISO`、`TP_SCK` 等 SPI 信号，用于触摸芯片通信。
 
 ---
+# 13. 正点原子 ZYNQ7020 FPGA 驱动 LCD 屏幕 (800x480) 开发记录
+
+## 13.1 核心问题与避坑指南
+在 LCD 驱动开发中，最容易导致**屏幕全黑无反应**的两个核心暗坑：
+1. **时钟 IP 核（MMCM/PLL）的复位极性问题（最易踩坑）**
+   * **现象**：系统复位信号（`sys_rst_n`）通常是**低电平有效**，但 Vivado 生成的 Clocking Wizard (MMCM/PLL) IP 核默认是**高电平复位**。
+   * **解决**：如果在例化 IP 核时直接传入 `sys_rst_n`，会导致 IP 核一直处于复位卡死状态，没有时钟输出。**必须取反传入**：`.reset(~sys_rst_n)`。
+2. **RGB LCD 时钟相位采样问题**
+   * **现象**：时序完全正确，但屏幕画面错位、闪烁或黑屏。
+   * **解决**：FPGA 默认在时钟**上升沿**输出数据，但很多市面上的屏幕（包括正点原子部分屏幕）要求在时钟**下降沿**采样数据以保证稳定性。
+   * **操作**：在顶层输出时钟给屏幕时进行反相：`assign lcd_clk = ~pixel_clk;`。
+---
+## 13.2 800x480 分辨率标准时序参数
+当时钟频率设定为 **33.333MHz** 时，标准的 60Hz 刷新率时序参数推荐如下（总像素 1056 x 525 ≈ 33.26MHz，适配 33.3M 时钟）：
+| 参数类别 | 变量名   | 数值 (时钟周期/行) | 含义 |
+| :--- | :--- | :--- | :--- |
+| **行时序 (H)** | `H_SYNC` | 128 | 行同步脉冲宽度 |
+| | `H_BACK` | 88 | 行后沿 |
+| | `H_DISP` | 800 | **行有效显示区域** |
+| | `H_FRONT`| 40 | 行前沿 |
+| | **`H_TOTAL`**| **1056** | 行总周期 |
+| **场时序 (V)** | `V_SYNC` | 2 | 场同步脉冲宽度 |
+| | `V_BACK` | 33 | 场后沿 |
+| | `V_DISP` | 480 | **场有效显示区域** |
+| | `V_FRONT`| 10 | 场前沿 |
+| | **`V_TOTAL`**| **525** | 场总周期 |
+---
+## 13.3 顶层模块代码 (Top Module)
+顶层文件负责连接 MMCM 时钟、VGA 时序生成器和彩条生成器。
+```VERILOG
+module top_lcd_display(
+    input  wire        sys_clk,      // 系统时钟 (如 50MHz)
+    input  wire        sys_rst_n,    // 系统复位，低电平有效
+    
+    // LCD 接口
+    output wire        lcd_clk,      // LCD 像素时钟
+    output wire        lcd_hs,       // 行同步信号
+    output wire        lcd_vs,       // 场同步信号
+    output wire        lcd_de,       // 数据使能信号
+    output wire [23:0] lcd_rgb,      // RGB888 数据输出
+    output wire        lcd_bl        // 背光控制
+);
+    wire        pixel_clk;   // 33.333MHz 像素时钟
+    wire        pll_locked;  // PLL 锁相标志
+    wire        global_rst;  // 全局复位
+    wire [11:0] pixel_x;     // 当前像素点 X 坐标
+    wire [11:0] pixel_y;     // 当前像素点 Y 坐标
+    // 1. 点亮背光
+    assign lcd_bl = 1'b1;
+    // 2. 屏幕时钟反相输出 (错开半个周期，满足屏幕下降沿采样需求)
+    assign lcd_clk = ~pixel_clk; 
+    // 3. 全局复位信号：系统复位且 PLL 锁定后才释放复位
+    assign global_rst = sys_rst_n & pll_locked;
+    // 4. MMCM IP核例化 (输出 33.333MHz)
+    clk_wiz_0 u_clk_wiz (
+        .clk_in1  (sys_clk),
+        .clk_out1 (pixel_clk),
+        // 【核心避坑】: MMCM是高复位，按键是低复位，必须取反！
+        .reset    (~sys_rst_n),  
+        .locked   (pll_locked)
+    );
+    // 5. 时序控制模块
+    vga_timing u_vga_timing(
+        .clk        (pixel_clk),
+        .rst_n      (global_rst),
+        .lcd_hs     (lcd_hs),
+        .lcd_vs     (lcd_vs),
+        .lcd_de     (lcd_de),
+        .pixel_x    (pixel_x),
+        .pixel_y    (pixel_y)
+    );
+    // 6. 画面生成模块 (彩条测试)
+    color_bar u_color_bar (
+        .clk        (pixel_clk),
+        .rst_n      (global_rst),
+        .video_de   (lcd_de),
+        .pixel_x    (pixel_x),
+        .pixel_y    (pixel_y),
+        .lcd_rgb    (lcd_rgb)
+    );
+endmodule
+```
+13.4 时序控制模块代码 (VGA Timing)
+本模块产生标准的行/场同步信号和数据使能 (DE) 信号。
+
+```VERILOG
+module vga_timing (
+    input  wire        clk,       // 像素时钟 (33.333MHz)
+    input  wire        rst_n,     // 复位信号
+    output wire        lcd_hs,    // 行同步信号
+    output wire        lcd_vs,    // 场同步信号
+    output wire        lcd_de,    // 数据使能信号
+    output wire [11:0] pixel_x,   // 有效像素 X 坐标
+    output wire [11:0] pixel_y    // 有效像素 Y 坐标
+);
+    // 800x480 分辨率参数定义
+    parameter H_SYNC  = 12'd128;
+    parameter H_BACK  = 12'd88;
+    parameter H_DISP  = 12'd800;
+    parameter H_FRONT = 12'd40;
+    parameter H_TOTAL = 12'd1056;
+    parameter V_SYNC  = 12'd2;
+    parameter V_BACK  = 12'd33;
+    parameter V_DISP  = 12'd480;
+    parameter V_FRONT = 12'd10;
+    parameter V_TOTAL = 12'd525;
+    reg [11:0] h_cnt;
+    reg [11:0] v_cnt;
+    // 行计数器
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            h_cnt <= 12'd0;
+        else if (h_cnt == H_TOTAL - 1'b1)
+            h_cnt <= 12'd0;
+        else
+            h_cnt <= h_cnt + 1'b1;
+    end
+    // 场计数器
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            v_cnt <= 12'd0;
+        else if (h_cnt == H_TOTAL - 1'b1) begin
+            if (v_cnt == V_TOTAL - 1'b1)
+                v_cnt <= 12'd0;
+            else
+                v_cnt <= v_cnt + 1'b1;
+        end
+    end
+    // 同步信号极性配置 (大部分 RGB 屏幕为低电平同步有效)
+    assign lcd_hs = (h_cnt < H_SYNC) ? 1'b0 : 1'b1;
+    assign lcd_vs = (v_cnt < V_SYNC) ? 1'b0 : 1'b1;
+    // 数据使能信号 DE (处于显示区域时拉高)
+    assign lcd_de = (h_cnt >= H_SYNC + H_BACK) && (h_cnt < H_SYNC + H_BACK + H_DISP) &&
+                    (v_cnt >= V_SYNC + V_BACK) && (v_cnt < V_SYNC + V_BACK + V_DISP);
+    // 输出当前有效坐标 (相对于显示区域的 0,0 点)
+    assign pixel_x = lcd_de ? (h_cnt - (H_SYNC + H_BACK)) : 12'd0;
+    assign pixel_y = lcd_de ? (v_cnt - (V_SYNC + V_BACK)) : 12'd0;
+endmodule
+```
+13.5 彩条测试模块代码 (Color Bar)
+利用时序模块输出的 pixel_x 坐标，将 800 的宽度分成 5 等份，显示不同的颜色。
+
+```VERILOG
+module color_bar (
+    input  wire        clk,       
+    input  wire        rst_n,     
+    input  wire        video_de,  // 画面有效信号
+    input  wire [11:0] pixel_x,   // 0~799
+    input  wire [11:0] pixel_y,   // 0~479
+    output reg  [23:0] lcd_rgb    // RGB 输出
+);
+    // 定义常见颜色代码 (RGB888)
+    localparam WHITE = 24'hFFFFFF;
+    localparam RED   = 24'hFF0000;
+    localparam GREEN = 24'h00FF00;
+    localparam BLUE  = 24'h0000FF;
+    localparam BLACK = 24'h000000;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            lcd_rgb <= BLACK;
+        end 
+        else if (video_de) begin
+            // 将 800 个像素点分为 5 段，每段 160 像素
+            if      (pixel_x < 12'd160) lcd_rgb <= WHITE;
+            else if (pixel_x < 12'd320) lcd_rgb <= RED;
+            else if (pixel_x < 12'd480) lcd_rgb <= GREEN;
+            else if (pixel_x < 12'd640) lcd_rgb <= BLUE;
+            else                        lcd_rgb <= BLACK;
+        end 
+        else begin
+            // 非显示区域输出黑色
+            lcd_rgb <= BLACK; 
+        end
+    end
+endmodule
+```
+13.6 常见问题排查清单
+如果按照上述代码运行后屏幕依然黑屏或异常，请按顺序排查：
+
+检查背光引脚与供电
+背光控制引脚（lcd_bl）是否在约束文件中绑定正确并拉高？
+屏幕 FPC 排线是否插反？
+锁相环是否正常工作
+将 pll_locked 信号连接到板载 LED 上。如果 LED 不亮，说明时钟根本没跑起来，彻底检查输入时钟管脚约束和复位极性。
+引脚电平标准
+检查 .xdc 约束文件，确保所有的 LCD 引脚的 IOSTANDARD 都设置为了 LVCMOS33。
+排除逻辑问题进行暴力测试
+把彩条代码暂时注释掉，直接在顶层文件写死：assign lcd_rgb = lcd_de ? 24'hFF0000 : 24'h000000;，看屏幕是否能变为全红。如果能，说明时序正常，仅仅是彩条模块写错了。
